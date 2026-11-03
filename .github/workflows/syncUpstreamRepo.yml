@@ -1,40 +1,123 @@
+name: 5. Automatic dev updates
+run-name: Check upstream iAPS dev
 
-name: 5. Sync Upstream
-run-name: Sync Upstream (${{ github.ref_name }})
-
-env:
-  UPSTREAM_URL: "https://github.com/Artificial-Pancreas/iAPS.git"
-  WORKFLOW_TOKEN: ${{ secrets.GH_PAT }}
-  UPSTREAM_BRANCH: "${{ github.ref_name }}"
-  DOWNSTREAM_BRANCH: "${{ github.ref_name }}"
-  # Optional fetch arguments
-  FETCH_ARGS: ""
-  # Optional merge arguments
-  MERGE_ARGS: ""
-  # Optional push arguments
-  PUSH_ARGS: ""
-  # Optional toggle to spawn time logs (keeps action active)
-  SPAWN_LOGS: "false" # "true" or "false"
-
-on: 
-
+on:
   schedule:
-    - cron: '0 3 * * *'             # scheduled to run daily
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if this upstream version is already in TestFlight
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/syncUpstreamRepo.yml
+      - .github/scripts/check-dev-update.cjs
 
-  workflow_dispatch:                # trigger manually
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: iaps-dev-update-controller
+  cancel-in-progress: false
 
 jobs:
-  build:
+  update:
+    name: Check, sync and request TestFlight build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: GitHub Sync to Upstream Repository
-        uses: Artificial-Pancreas/sync-upstream-repo@master
+      - name: Check one-time setup
+        id: setup
+        env:
+          TEAMID: ${{ secrets.TEAMID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
+          FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
+          FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          SKIP_UPLOAD: ${{ vars.SKIP_TESTFLIGHT_UPLOAD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for key in TEAMID GH_PAT FASTLANE_KEY_ID FASTLANE_ISSUER_ID FASTLANE_KEY MATCH_PASSWORD; do
+            if [ -z "${!key}" ]; then missing+=("$key"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo '## Waiting for one-time signing setup' >> "$GITHUB_STEP_SUMMARY"
+            printf 'Missing repository secret: `%s`\n' "${missing[@]}" >> "$GITHUB_STEP_SUMMARY"
+            echo 'See AUTOMATIC_TESTFLIGHT.md. No build was started.' >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$SKIP_UPLOAD" = true ]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo 'TestFlight uploads are disabled by SKIP_TESTFLIGHT_UPLOAD. No automatic build was started.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout automation
+        if: steps.setup.outputs.ready == 'true'
+        uses: actions/checkout@v5
         with:
-          upstream_repo: ${{ env.UPSTREAM_URL }}
-          upstream_branch: ${{ env.UPSTREAM_BRANCH }}
-          downstream_branch: ${{ env.DOWNSTREAM_BRANCH }}
-          token: ${{ env.WORKFLOW_TOKEN }}
-          fetch_args: ${{ env.FETCH_ARGS }}
-          merge_args: ${{ env.MERGE_ARGS }}
-          push_args: ${{ env.PUSH_ARGS }}
-          spawn_logs: ${{ env.SPAWN_LOGS }}
+          ref: main
+          path: automation
+          persist-credentials: false
+
+      - name: Decide whether a build is needed
+        if: steps.setup.outputs.ready == 'true'
+        id: check
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const check = require('./automation/.github/scripts/check-dev-update.cjs');
+            await check({ github, context, core });
+
+      - name: Checkout dev for synchronisation
+        if: steps.check.outputs.sync == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: dev
+          path: source
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+
+      - name: Update dev to the exact upstream commit
+        if: steps.check.outputs.sync == 'true'
+        working-directory: source
+        env:
+          SOURCE_SHA: ${{ steps.check.outputs.sha }}
+          EXPECTED_SHA: ${{ steps.check.outputs.previous_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 https://github.com/Artificial-Pancreas/iAPS.git "$SOURCE_SHA"
+          test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+          git push origin "$SOURCE_SHA:refs/heads/dev" --force-with-lease="refs/heads/dev:$EXPECTED_SHA"
+
+      - name: Request the official iAPS TestFlight build
+        if: steps.check.outputs.build == 'true'
+        uses: actions/github-script@v8
+        env:
+          SOURCE_SHA: ${{ steps.check.outputs.sha }}
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const repo = context.repo;
+            const { data: branch } = await github.rest.repos.getBranch({ ...repo, branch: 'dev' });
+            if (branch.commit.sha !== process.env.SOURCE_SHA) {
+              throw new Error('dev changed during synchronisation; the next check will retry.');
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              ...repo, workflow_id: 'build_iAPS.yml', ref: 'dev'
+            });
+            await core.summary.addHeading('TestFlight build requested')
+              .addRaw(`Source: Artificial-Pancreas/iAPS dev at ${process.env.SOURCE_SHA}\n\n`)
+              .addLink('Follow the build', `https://github.com/${repo.owner}/${repo.repo}/actions/workflows/build_iAPS.yml`)
+              .write();
