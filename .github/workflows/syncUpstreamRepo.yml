@@ -84,7 +84,7 @@ jobs:
           ref: dev
           path: source
           token: ${{ secrets.GH_PAT }}
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Update dev to the exact upstream commit
         if: steps.check.outputs.sync == 'true'
@@ -97,7 +97,7 @@ jobs:
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git fetch --no-tags --depth=1 https://github.com/Artificial-Pancreas/iAPS.git "$SOURCE_SHA"
+          git fetch --no-tags https://github.com/Artificial-Pancreas/iAPS.git "$SOURCE_SHA"
           test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
           git push origin "$SOURCE_SHA:refs/heads/dev" --force-with-lease="refs/heads/dev:$EXPECTED_SHA"
 
